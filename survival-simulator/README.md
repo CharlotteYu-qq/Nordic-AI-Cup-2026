@@ -163,3 +163,5 @@ The default movement logic for agents can be found in [dummy_agent_policy.py](sr
 The simulation is deterministic as long as it runs on the same OS. If you want to test how a specific seed runs on the validation/evaluation server, you should test on a Linux machine.
 
 To avoid bottlenecking the system, the server will wait for responses for up to 10 seconds. If no responses are received from the agent server within that time or if the accumulated wait time reaches 600 seconds, the run will end.
+
+There was an issue with the testing endpoint: the `sim_time` and `n_agents` values are missing in this step, which causes the server to return HTTP 422. If you have not yet updated the repository, you can alternatively add these values manually in `survival_simulator/src/utils/DTOs.py` — i.e. `sim_time: float = 0.0` and `n_agents: int = 0`.
