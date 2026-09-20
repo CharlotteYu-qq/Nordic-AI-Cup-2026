@@ -35,8 +35,8 @@ class StepResponse(BaseModel):
     """
     Data transfer object to receive a step response
     """
-    game_status: str
-    score: float
+    game_status: str = "ok"
+    score: float = 0.0
     sim_time: float = 0.0
     n_agents: int = 0
     agent_status: List[ObservationResponse] = []

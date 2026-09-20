@@ -61,7 +61,7 @@ from utils import (
 )
 
 
-DEFAULT_URL = 'http://localhost:9053/predict'
+DEFAULT_URL = 'http://localhost:8000/predict'
 # Derived the same way the evaluation service derives them, so the numbers you
 # see in the request here are the numbers you will see in an attempt.
 FRAMES_PER_SECOND = 3.0

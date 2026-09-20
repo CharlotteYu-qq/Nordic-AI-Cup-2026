@@ -1,1 +1,36 @@
+# Python
 __pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model weights
+*.pt
+*.pth
+*.ckpt
+
+# Datasets
+datasets/
+*_raw/
+*_dataset/
+recorded_sequences/
+inspected_online_frames/
+mined_crops/
+
+# Archives / large data
+*.tar.gz
+*.zip
+
+# Training / experiment outputs
+runs/
+
+# Logs
+*.log
+
+# OS
+.DS_Store__pycache__/

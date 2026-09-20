@@ -1,59 +1,160 @@
-"""The baseline. This is the file to replace.
-
-It answers ``True`` to everything and points at nothing, which scores the floor
-and nothing more. It is here to prove the plumbing — that the audio arrives
-intact and that your server speaks the protocol — not to compete.
-
-Note how weak that floor now is. Answering yes to everything still gets half
-the questions right, but it finds none of the evidence, and evidence is the
-larger half of the score. The sketch under the dummy model shows where a real
-system goes.
-"""
-
+import io
 import logging
-from typing import Optional, Tuple
+import re
+import time
+from typing import List, Optional, Tuple
 
 from dtos import ASRQuestionRequestDto, ASRQuestionResponseDto
-from utils import Span, audio_duration_seconds, decode_audio
+from faster_whisper import WhisperModel
+from sentence_transformers import CrossEncoder
+from utils import Span, decode_audio
 
 logger = logging.getLogger(__name__)
 
+# ----------------- 全局加载轻量模型 -----------------
+# cpu_threads=4 显式利用多核；int8 量化极速推理
+logger.info("Loading Faster-Whisper on CPU with multi-threading...")
+asr_model = WhisperModel(
+    "small.en", 
+    device="cpu", 
+    compute_type="int8", 
+    cpu_threads=4, 
+    num_workers=1
+)
 
-### CALL YOUR CUSTOM MODEL VIA THIS FUNCTION ###
+logger.info("Loading Passage Ranking Cross-Encoder...")
+ranker_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+WORD_TO_NUM = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10"
+}
+
+
+def merge_whisper_segments(segments, max_gap: float = 0.8, max_duration: float = 5.0):
+    merged = []
+    curr_start, curr_end, curr_text = None, None, ""
+
+    for seg in segments:
+        text = seg.text.strip()
+        if not text:
+            continue
+        if curr_start is None:
+            curr_start, curr_end, curr_text = seg.start, seg.end, text
+        else:
+            gap = seg.start - curr_end
+            new_duration = seg.end - curr_start
+            if gap < max_gap and new_duration <= max_duration:
+                curr_end = seg.end
+                curr_text += " " + text
+            else:
+                merged.append((curr_start, curr_end, curr_text))
+                curr_start, curr_end, curr_text = seg.start, seg.end, text
+
+    if curr_start is not None:
+        merged.append((curr_start, curr_end, curr_text))
+    return merged
+
+
+def normalize_text(text: str) -> str:
+    return re.sub(r"[^\w\s]", "", text.lower())
+
+
+def answer_from_transcript(
+    segments: List[Tuple[float, float, str]], question: str
+) -> Tuple[bool, Optional[Span]]:
+    if not segments:
+        return True, None
+
+    # 1. 离题过滤
+    q_clean = normalize_text(question)
+    stop_words = {
+        "did", "the", "patient", "doctor", "have", "any", "was",
+        "were", "is", "a", "an", "in", "on", "of", "to", "for", "take", "report", "been"
+    }
+    q_words = [w for w in q_clean.split() if w not in stop_words]
+
+    full_transcript = " ".join([seg[2] for seg in segments]).lower()
+    overlap = sum(1 for w in q_words if w in full_transcript)
+
+    if q_words and overlap == 0:
+        return False, None
+
+    # 2. 定位最相关句子
+    pairs = [(question, seg[2]) for seg in segments]
+    scores = ranker_model.predict(pairs)
+
+    best_idx = int(scores.argmax())
+    best_score = float(scores[best_idx])
+    best_seg = segments[best_idx]
+
+    # 3. 针对 hard_negative 的数值防御
+    q_nums = set(re.findall(r"\b\d+(?:\.\d+)?\b", question))
+    if q_nums:
+        ctx_start = max(0, best_idx - 1)
+        ctx_end = min(len(segments), best_idx + 2)
+        local_text = " ".join([segments[i][2] for i in range(ctx_start, ctx_end)]).lower()
+        
+        for word, num in WORD_TO_NUM.items():
+            local_text = re.sub(rf"\b{word}\b", num, local_text)
+            
+        local_nums = set(re.findall(r"\b\d+(?:\.\d+)?\b", local_text))
+
+        if local_nums and not (q_nums & local_nums):
+            return False, None
+
+    # 4. 判定得分门槛
+    if best_score < -3.0:
+        return False, None
+
+    # 5. 时间戳微调
+    start_time = max(0.0, best_seg[0] - 0.3)
+    end_time = best_seg[1] + 0.3
+
+    if (end_time - start_time) < 2.5:
+        end_time = min(end_time + 1.2, segments[-1][1])
+
+    return True, (round(start_time, 2), round(end_time, 2))
+
 
 def predict(request: ASRQuestionRequestDto) -> ASRQuestionResponseDto:
-    """Answer every question about one conversation.
-
-    The whole conversation and all of its questions arrive together, so the
-    expensive half — transcription — is paid once here and shared by every
-    answer below.
-    """
+    start_req_time = time.time()
     audio_bytes = decode_audio(request.audio_base64)
+    audio_stream = io.BytesIO(audio_bytes)
 
-    duration = audio_duration_seconds(audio_bytes)
-    logger.info(
-        '%s (%.1f s, %.1f MB): %d questions',
-        request.audio_filename,
-        duration if duration is not None else float('nan'),
-        len(audio_bytes) / 1e6,
-        len(request.questions),
-    )
+    try:
+        # 极速转录设置：
+        # beam_size=1（Greedy，速度翻倍）
+        # vad_filter=True（切除静音期，长音频省去大量计算）
+        raw_segments, _ = asr_model.transcribe(
+            audio_stream,
+            beam_size=1,
+            language="en",
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500)
+        )
+        transcript_segments = merge_whisper_segments(list(raw_segments))
+    except Exception as e:
+        logger.exception("ASR failed, fallback to defaults: %s", e)
+        transcript_segments = []
 
-    # Never let this raise. An exception means no response, and no response
-    # means every question about this conversation is scored wrong — ten marks,
-    # not one. A guess is worth half a mark on average; an error is worth
-    # nothing.
     answers = []
     evidence_start = []
     evidence_end = []
 
     for question in request.questions:
+        # 防超时保护：若已耗时 52 秒，放弃深层匹配，保底返回 True 避免 60 秒硬超时被罚 0 分
+        if time.time() - start_req_time > 52.0:
+            logger.warning("Approaching 60s timeout limit, fast fallback for: %s", question)
+            answers.append(True)
+            evidence_start.append(None)
+            evidence_end.append(None)
+            continue
+
         try:
-            answer, span = answer_question(
-                audio_bytes, request.audio_filename, question
-            )
+            answer, span = answer_from_transcript(transcript_segments, question)
         except Exception:
-            logger.exception('Falling back to a guess for: %s', question)
+            logger.exception("Fallback for question: %s", question)
             answer, span = True, None
 
         answers.append(answer)
@@ -65,59 +166,3 @@ def predict(request: ASRQuestionRequestDto) -> ASRQuestionResponseDto:
         evidence_start=evidence_start,
         evidence_end=evidence_end,
     )
-
-
-### DUMMY MODEL ###
-
-def answer_question(
-    audio_bytes: bytes,
-    audio_filename: str,
-    question: str,
-) -> Tuple[bool, Optional[Span]]:
-    """Always says yes, and never says where.
-
-    Both splits are exactly balanced between yes and no, so the answer half of
-    this scores 0.500: every ``positive`` question right, every
-    ``hard_negative`` and ``off_topic`` question wrong. The evidence half scores
-    0.000, because ``None`` means "nothing to point at" and every annotated yes
-    question is therefore missed. Run ``local_evaluator.py`` and read the
-    per-type breakdown and the evidence block — that shape is the problem you
-    are solving.
-
-    Replace this. The shape of a real answer is roughly:
-
-        def predict(request):
-            # The expensive half, paid once per request rather than once per
-            # question. Ten questions share this transcript.
-            segments = transcribe(decode_audio(request.audio_base64))
-
-            answers, starts, ends = [], [], []
-
-            for question in request.questions:
-                answer, span = answer_from_transcript(segments, question)
-                answers.append(answer)
-                starts.append(span[0] if span else None)
-                ends.append(span[1] if span else None)
-
-            return ASRQuestionResponseDto(
-                answers=answers, evidence_start=starts, evidence_end=ends,
-            )
-
-    where ``transcribe`` is a local ASR model **that returns timestamps** — the
-    span you send back is the start and end of the segment you read the answer
-    off, so word- or segment-level timing is not an optional extra here. Both
-    halves must run without calling a cloud API; see the Rules section of the
-    README.
-
-    Two things to watch while you work:
-
-    Return the passage, not the clip. A span covering the whole conversation
-    overlaps every annotation and scores a temporal IoU near zero against all
-    of them.
-
-    Watch the ``hard_negative`` questions. They are near-misses on dose, drug
-    and entity — "0.15 mg" against a transcript that says "0.3 mg" — so
-    anything that answers from topical overlap alone stays at the floor no
-    matter how good the transcript is.
-    """
-    return True, None

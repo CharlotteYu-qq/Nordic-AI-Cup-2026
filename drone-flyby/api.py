@@ -20,7 +20,7 @@ from example import predict
 from utils import validate_response
 
 HOST = '0.0.0.0'
-PORT = 9053
+PORT = 8000
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
